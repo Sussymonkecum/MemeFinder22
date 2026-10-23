@@ -1,32 +1,26 @@
 
-'use strict';
-
 /**
  * MemeRadar Scorer
  * ----------------
  * Features:
  * 1. Repeated coin evaluation during a launch window.
- * 2. Composite scoring and optional adaptive logistic learning.
- * 3. Independent outcome tracking for EVERY detected coin,
- *    including rejected coins, at 1, 5, 15, and 60 minutes.
+ * 2. Composite scoring and adaptive logistic learning.
+ * 3. Independent outcome tracking for all detected coins.
  * 4. Paper trading with take-profit, stop-loss, and max hold.
  * 5. Persistent local state and JSON API endpoints.
  *
  * Requirements: Node.js 18+
  * Install: npm install express dotenv
- * Run: node memeradar-scorer.js
+ * Run: npm start
  *
- * Paper trading only. No real trades or wallet signing.
+ * IMPORTANT: Paper trading only. No real trades or wallet signing.
  */
 
-require('dotenv').config();
+import 'dotenv/config';
 
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-
-const app = express();
-app.use(express.json({ limit: '1mb' }));
+import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
 
 // ------------------------------------------------------------
 // CONFIGURATION
@@ -38,14 +32,12 @@ const CONFIG = {
     process.env.STATE_FILE || './memeradar-state.json'
   ),
 
-  // Evaluation
   EVALUATION_WINDOW_SECONDS: 60,
   EVALUATION_INTERVAL_SECONDS: 10,
   MIN_VALID_SAMPLES: 3,
   MIN_SCORE: 65,
   MAX_PRICE_DROP_PCT: 15,
 
-  // Paper trading
   PAPER_TRADE_AMOUNT_USD: 10,
   MAX_OPEN_POSITIONS: 5,
   TAKE_PROFIT_PCT: 25,
@@ -53,26 +45,22 @@ const CONFIG = {
   MAX_HOLD_MINUTES: 60,
   POSITION_CHECK_SECONDS: 15,
 
-  // Outcome tracking, independent of trading decisions
   OUTCOME_HORIZONS_MINUTES: [1, 5, 15, 60],
   OUTCOME_SAMPLE_INTERVAL_SECONDS: 15,
   MAX_OUTCOME_RECORDS: 50000,
 
-  // Learning
   LEARNING_ENABLED: true,
   LEARNING_MIN_SAMPLES: 50,
   LEARNING_RATE: 0.03,
   LEARNING_L2: 0.001,
   LEARNING_BLEND: 0.35,
 
-  // External data
   BIRDEYE_API_KEY: process.env.BIRDEYE_API_KEY || '',
   RUGCHECK_API_KEY: process.env.RUGCHECK_API_KEY || '',
   WEBHOOK_SECRET: process.env.WEBHOOK_SECRET || '',
   PRICE_API_TIMEOUT_MS: 8000,
 };
 
-// Features are scored from 0 to 100.
 const FEATURE_NAMES = [
   'holderSafety',
   'deployerHistory',
@@ -93,16 +81,19 @@ const BASE_WEIGHTS = {
   smartMoney: 0.10,
 };
 
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
 // ------------------------------------------------------------
-// PERSISTENT STATE
+// STATE
 // ------------------------------------------------------------
 
 let evaluationQueue = [];
-let watchlist = [];
 let openPositions = [];
 let closedTrades = [];
 let coinOutcomes = [];
 let seenMints = new Set();
+
 let outcomeTrackerBusy = false;
 let evaluationBusy = false;
 let positionMonitorBusy = false;
@@ -111,9 +102,7 @@ function createLearningModel() {
   return {
     version: 1,
     samples: 0,
-    weights: Object.fromEntries(
-      FEATURE_NAMES.map(name => [name, 0])
-    ),
+    weights: Object.fromEntries(FEATURE_NAMES.map(name => [name, 0])),
     bias: 0,
     wins: 0,
     losses: 0,
@@ -124,7 +113,10 @@ function createLearningModel() {
 let learningModel = createLearningModel();
 
 function finite(value) {
-  return Number.isFinite(Number(value));
+  return value !== null &&
+    value !== undefined &&
+    value !== '' &&
+    Number.isFinite(Number(value));
 }
 
 function clamp(value, min = 0, max = 100) {
@@ -147,7 +139,6 @@ function saveState() {
   const state = {
     savedAt: new Date().toISOString(),
     evaluationQueue,
-    watchlist,
     openPositions,
     closedTrades,
     coinOutcomes,
@@ -158,18 +149,30 @@ function saveState() {
   const tempFile = `${CONFIG.STATE_FILE}.tmp`;
 
   try {
+    const directory = path.dirname(CONFIG.STATE_FILE);
+
+    if (!fs.existsSync(directory)) {
+      fs.mkdirSync(directory, { recursive: true });
+    }
+
     fs.writeFileSync(tempFile, JSON.stringify(state, null, 2));
     fs.renameSync(tempFile, CONFIG.STATE_FILE);
   } catch (error) {
     console.error('Failed to save state:', error.message);
+
     try {
       if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
-    } catch (_) {}
+    } catch {
+      // Ignore cleanup errors.
+    }
   }
 }
 
 function loadState() {
-  if (!fs.existsSync(CONFIG.STATE_FILE)) return;
+  if (!fs.existsSync(CONFIG.STATE_FILE)) {
+    console.log('No previous state file found; starting fresh.');
+    return;
+  }
 
   try {
     const state = JSON.parse(
@@ -177,19 +180,20 @@ function loadState() {
     );
 
     evaluationQueue = Array.isArray(state.evaluationQueue)
-      ? state.evaluationQueue : [];
-
-    watchlist = Array.isArray(state.watchlist)
-      ? state.watchlist : [];
+      ? state.evaluationQueue
+      : [];
 
     openPositions = Array.isArray(state.openPositions)
-      ? state.openPositions : [];
+      ? state.openPositions
+      : [];
 
     closedTrades = Array.isArray(state.closedTrades)
-      ? state.closedTrades : [];
+      ? state.closedTrades
+      : [];
 
     coinOutcomes = Array.isArray(state.coinOutcomes)
-      ? state.coinOutcomes : [];
+      ? state.coinOutcomes
+      : [];
 
     seenMints = new Set(
       Array.isArray(state.seenMints) ? state.seenMints : []
@@ -199,13 +203,18 @@ function loadState() {
       learningModel = {
         ...createLearningModel(),
         ...state.learningModel,
+        weights: {
+          ...createLearningModel().weights,
+          ...(state.learningModel.weights || {}),
+        },
       };
     }
 
     console.log(
-      `Loaded state: ${coinOutcomes.length} outcomes, ` +
+      `Loaded ${coinOutcomes.length} outcomes, ` +
       `${closedTrades.length} closed trades, ` +
-      `${openPositions.length} open positions.`
+      `${openPositions.length} open positions, ` +
+      `${learningModel.samples} learning samples.`
     );
   } catch (error) {
     console.error('Could not load saved state:', error.message);
@@ -256,7 +265,8 @@ function extractLaunchMint(event) {
   ];
 
   return candidates.find(
-    value => typeof value === 'string' &&
+    value =>
+      typeof value === 'string' &&
       /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)
   ) || null;
 }
@@ -276,7 +286,6 @@ function escapeHtml(value) {
 // ------------------------------------------------------------
 
 async function getApproxPrice(mint) {
-  // Primary: Birdeye, if an API key is configured.
   if (CONFIG.BIRDEYE_API_KEY) {
     try {
       const data = await fetchJson(
@@ -290,13 +299,15 @@ async function getApproxPrice(mint) {
       );
 
       const price = Number(data?.data?.value);
-      if (price > 0 && Number.isFinite(price)) return price;
+
+      if (price > 0 && Number.isFinite(price)) {
+        return price;
+      }
     } catch (error) {
       console.warn('Birdeye price lookup failed:', error.message);
     }
   }
 
-  // Fallback: DexScreener token pairs.
   try {
     const data = await fetchJson(
       `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(mint)}`
@@ -348,6 +359,9 @@ async function getTokenMetadata(mint) {
         marketCap: null,
         pairAddress: null,
         dexPaid: false,
+        volume24h: 0,
+        priceChange5m: 0,
+        priceChange1h: 0,
       };
     }
 
@@ -366,6 +380,7 @@ async function getTokenMetadata(mint) {
     };
   } catch (error) {
     console.warn('Token metadata lookup failed:', error.message);
+
     return {
       name: mint.slice(0, 8),
       symbol: mint.slice(0, 6),
@@ -374,6 +389,9 @@ async function getTokenMetadata(mint) {
       marketCap: null,
       pairAddress: null,
       dexPaid: false,
+      volume24h: 0,
+      priceChange5m: 0,
+      priceChange1h: 0,
     };
   }
 }
@@ -402,15 +420,18 @@ async function getHolderAndDevData(mint, deployer) {
     );
 
     const holders = data?.data?.items || data?.data?.holders || [];
+
     if (!holders.length) return result;
 
     const total = holders.reduce(
-      (sum, holder) => sum + Number(holder.ui_amount || holder.amount || 0),
+      (sum, holder) =>
+        sum + Number(holder.ui_amount || holder.amount || 0),
       0
     );
 
     const topHolder = total > 0
-      ? Number(holders[0].ui_amount || holders[0].amount || 0) / total * 100
+      ? Number(holders[0].ui_amount || holders[0].amount || 0) /
+        total * 100
       : null;
 
     const dev = holders.find(holder =>
@@ -425,6 +446,7 @@ async function getHolderAndDevData(mint, deployer) {
     result.holderCount = holders.length;
     result.topHolderPct = finite(topHolder) ? topHolder : null;
     result.devHoldingPct = total > 0 ? devAmount / total * 100 : null;
+
     result.holderSafety = topHolder === null
       ? 50
       : clamp(100 - topHolder * 2.5);
@@ -444,15 +466,16 @@ async function getHolderAndDevData(mint, deployer) {
 async function getRugCheckReport(mint) {
   try {
     const headers = {};
+
     if (CONFIG.RUGCHECK_API_KEY) {
-      headers['Authorization'] = `Bearer ${CONFIG.RUGCHECK_API_KEY}`;
+      headers.Authorization = `Bearer ${CONFIG.RUGCHECK_API_KEY}`;
     }
 
     return await fetchJson(
       `https://api.rugcheck.xyz/v1/tokens/${encodeURIComponent(mint)}/report`,
       { headers }
     );
-  } catch (_) {
+  } catch {
     return null;
   }
 }
@@ -468,10 +491,13 @@ function deriveLiquiditySafety(metadata, rugcheck) {
 
   if (rugcheck) {
     const risks = Array.isArray(rugcheck.risks)
-      ? rugcheck.risks : [];
+      ? rugcheck.risks
+      : [];
 
     const severe = risks.filter(risk =>
-      /high|danger|critical/i.test(String(risk.level || risk.name || ''))
+      /high|danger|critical/i.test(
+        String(risk.level || risk.name || '')
+      )
     ).length;
 
     score = clamp(score - severe * 20);
@@ -490,11 +516,13 @@ function deriveDeployerHistory(deployer) {
   if (!past.length) return 50;
 
   const wins = past.filter(trade => trade.pnlPct > 0).length;
+
   return clamp(50 + ((wins / past.length) - 0.5) * 100);
 }
 
 function deriveNarrativeScore(metadata) {
-  const text = `${metadata.name || ''} ${metadata.symbol || ''}`.toLowerCase();
+  const text =
+    `${metadata.name || ''} ${metadata.symbol || ''}`.toLowerCase();
 
   const keywords = [
     'ai', 'agent', 'dog', 'cat', 'frog', 'pepe',
@@ -503,14 +531,15 @@ function deriveNarrativeScore(metadata) {
 
   const hits = keywords.filter(word => text.includes(word)).length;
 
-  // This is a simple heuristic, not semantic AI analysis.
   return clamp(40 + hits * 12);
 }
 
 function deriveSmartMoneyScore(metadata) {
-  // Placeholder until reliable wallet-flow data is connected.
-  // Avoid pretending that actual smart-money wallets were identified.
-  if (metadata.volume24h > 100000 && metadata.liquidityUsd > 20000) {
+  // Placeholder: actual wallet-flow data is not connected.
+  if (
+    metadata.volume24h > 100000 &&
+    metadata.liquidityUsd > 20000
+  ) {
     return 65;
   }
 
@@ -518,7 +547,7 @@ function deriveSmartMoneyScore(metadata) {
 }
 
 // ------------------------------------------------------------
-// SCORING AND LEARNING
+// SCORING AND ADAPTIVE LEARNING
 // ------------------------------------------------------------
 
 function getFeatureVector(components) {
@@ -555,9 +584,11 @@ function getLearnedScore(baseScore, featureVector) {
   }
 
   const modelScore = predictLearningProbability(featureVector) * 100;
-  const blend = CONFIG.LEARNING_BLEND;
 
-  return clamp(baseScore * (1 - blend) + modelScore * blend);
+  return clamp(
+    baseScore * (1 - CONFIG.LEARNING_BLEND) +
+    modelScore * CONFIG.LEARNING_BLEND
+  );
 }
 
 function trainLearningModel(featureVector, won) {
@@ -596,6 +627,7 @@ function computeCompositeScore(components) {
     if (!finite(value)) continue;
 
     const weight = BASE_WEIGHTS[name];
+
     weightedSum += clamp(value) * weight;
     totalWeight += weight;
   }
@@ -650,7 +682,10 @@ async function collectCoinSnapshot(item) {
 // ------------------------------------------------------------
 
 function createOutcomeRecord(item) {
-  const existing = coinOutcomes.find(record => record.mint === item.mint);
+  const existing = coinOutcomes.find(
+    record => record.mint === item.mint
+  );
+
   if (existing) return existing;
 
   const scannedAt = new Date(item.addedTime).getTime();
@@ -676,18 +711,14 @@ function createOutcomeRecord(item) {
     tokenSymbol: item.tokenSymbol || item.mint.slice(0, 6),
     deployerWallet: item.deployerWallet || null,
     scannedAt: item.addedTime,
-
     baselinePrice: null,
     baselinePriceTime: null,
-
     initialScore: null,
     finalScore: null,
     decision: 'evaluating',
     rejectionReason: null,
-
     paperTraded: false,
     paperTradeEntryPrice: null,
-
     checkpoints,
     priceHistory: [],
     completed: false,
@@ -697,29 +728,39 @@ function createOutcomeRecord(item) {
   coinOutcomes.push(record);
 
   while (coinOutcomes.length > CONFIG.MAX_OUTCOME_RECORDS) {
-    const removableIndex = coinOutcomes.findIndex(o => o.completed);
+    const removableIndex = coinOutcomes.findIndex(
+      outcome => outcome.completed
+    );
+
     if (removableIndex === -1) break;
+
     coinOutcomes.splice(removableIndex, 1);
   }
 
   saveState();
+
   return record;
 }
 
-function updateOutcomeDecision(mint, {
-  decision,
-  score = null,
-  reason = null,
-  paperTraded = false,
-  entryPrice = null,
-} = {}) {
-  const record = coinOutcomes.find(o => o.mint === mint);
+function updateOutcomeDecision(
+  mint,
+  {
+    decision,
+    score = null,
+    reason = null,
+    paperTraded = false,
+    entryPrice = null,
+  } = {}
+) {
+  const record = coinOutcomes.find(outcome => outcome.mint === mint);
+
   if (!record) return;
 
-  record.decision = decision;
+  if (decision) record.decision = decision;
 
   if (finite(score)) {
     record.finalScore = Number(score);
+
     if (record.initialScore === null) {
       record.initialScore = Number(score);
     }
@@ -768,6 +809,7 @@ async function sampleCoinOutcome(record) {
     if (checkpoint.recorded) continue;
 
     const targetTime = scannedAt + minutes * 60000;
+
     if (now < targetTime) continue;
 
     const changePct =
@@ -776,7 +818,10 @@ async function sampleCoinOutcome(record) {
     checkpoint.recorded = true;
     checkpoint.price = price;
     checkpoint.observedAt = new Date(now).toISOString();
-    checkpoint.actualElapsedMinutes = round((now - scannedAt) / 60000, 2);
+    checkpoint.actualElapsedMinutes = round(
+      (now - scannedAt) / 60000,
+      2
+    );
     checkpoint.changePct = round(changePct);
     checkpoint.status = changePct > 0
       ? 'up'
@@ -794,6 +839,7 @@ async function sampleCoinOutcome(record) {
 
 async function runOutcomeTracker() {
   if (outcomeTrackerBusy) return;
+
   outcomeTrackerBusy = true;
 
   try {
@@ -825,12 +871,10 @@ function addToEvaluationQueue(mint, deployerWallet) {
 
   seenMints.add(mint);
 
-  const now = new Date().toISOString();
-
   const item = {
     mint,
     deployerWallet: deployerWallet || null,
-    addedTime: now,
+    addedTime: new Date().toISOString(),
     tokenName: mint.slice(0, 8),
     tokenSymbol: mint.slice(0, 6),
     snapshots: [],
@@ -840,6 +884,7 @@ function addToEvaluationQueue(mint, deployerWallet) {
   };
 
   evaluationQueue.push(item);
+
   createOutcomeRecord(item);
   saveState();
 
@@ -852,13 +897,15 @@ async function evaluateItem(item) {
 
   if (elapsedSeconds < 0) return;
 
-  if (
+  const shouldSample =
     elapsedSeconds < CONFIG.EVALUATION_WINDOW_SECONDS &&
-    item.snapshots.length === 0 ||
-    elapsedSeconds < CONFIG.EVALUATION_WINDOW_SECONDS &&
-    elapsedSeconds - (item.lastSampleElapsed || 0) >=
-      CONFIG.EVALUATION_INTERVAL_SECONDS
-  ) {
+    (
+      item.snapshots.length === 0 ||
+      elapsedSeconds - (item.lastSampleElapsed || 0) >=
+        CONFIG.EVALUATION_INTERVAL_SECONDS
+    );
+
+  if (shouldSample) {
     const snapshot = await collectCoinSnapshot(item);
 
     item.snapshots.push(snapshot);
@@ -867,13 +914,16 @@ async function evaluateItem(item) {
     item.tokenName = snapshot.metadata.name || item.tokenName;
     item.tokenSymbol = snapshot.metadata.symbol || item.tokenSymbol;
 
-    const outcome = coinOutcomes.find(o => o.mint === item.mint);
+    const outcome = coinOutcomes.find(
+      record => record.mint === item.mint
+    );
+
     if (outcome) {
       outcome.tokenName = item.tokenName;
       outcome.tokenSymbol = item.tokenSymbol;
-      saveState();
     }
 
+    saveState();
     return;
   }
 
@@ -885,8 +935,8 @@ async function evaluateItem(item) {
 async function finalizeEvaluation(item) {
   if (item.status !== 'evaluating') return;
 
-  const validSnapshots = item.snapshots.filter(snapshot =>
-    finite(snapshot.score)
+  const validSnapshots = item.snapshots.filter(
+    snapshot => finite(snapshot.score)
   );
 
   if (validSnapshots.length < CONFIG.MIN_VALID_SAMPLES) {
@@ -905,9 +955,10 @@ async function finalizeEvaluation(item) {
   const averageComponents = {};
 
   for (const name of FEATURE_NAMES) {
-    averageComponents[name] = average(
-      validSnapshots.map(snapshot => snapshot.components[name])
-    ) ?? 50;
+    averageComponents[name] =
+      average(
+        validSnapshots.map(snapshot => snapshot.components[name])
+      ) ?? 50;
   }
 
   const scoring = computeCompositeScore(averageComponents);
@@ -981,9 +1032,10 @@ async function finalizeEvaluation(item) {
         paperTraded: true,
         entryPrice,
       });
+    } else {
+      item.paperTradeSkippedReason = tradeResult.reason;
     }
   } else {
-    // The coin passed scoring, but no reliable entry price was found.
     item.status = 'accepted_no_entry_price';
   }
 
@@ -1003,11 +1055,13 @@ function simulateBuy(item, price) {
     return { opened: false, reason: 'invalid_entry_price' };
   }
 
-  const existing = openPositions.find(position =>
-    position.mint === item.mint
+  const existing = openPositions.find(
+    position => position.mint === item.mint
   );
 
-  if (existing) return { opened: false, reason: 'already_open' };
+  if (existing) {
+    return { opened: false, reason: 'already_open' };
+  }
 
   const position = {
     mint: item.mint,
@@ -1053,6 +1107,7 @@ async function evaluatePosition(position) {
 
   position.currentPrice = price;
   position.lastPrice = price;
+
   position.pnlPct =
     ((price - position.entryPrice) / position.entryPrice) * 100;
 
@@ -1074,6 +1129,8 @@ async function evaluatePosition(position) {
 
   if (closeReason) {
     closePosition(position, price, closeReason);
+  } else {
+    saveState();
   }
 }
 
@@ -1110,7 +1167,7 @@ function closePosition(position, exitPrice, reason) {
   closedTrades.push(trade);
   openPositions.splice(index, 1);
 
-  // Learn from completed paper trades only.
+  // The learner trains only on completed paper trades.
   trainLearningModel(trade.featureVector, trade.won);
 
   console.log(
@@ -1127,6 +1184,7 @@ function closePosition(position, exitPrice, reason) {
 
 async function runEvaluationWorker() {
   if (evaluationBusy) return;
+
   evaluationBusy = true;
 
   try {
@@ -1143,12 +1201,13 @@ async function runEvaluationWorker() {
       }
     }
 
-    // Keep recent evaluations for inspection.
     if (evaluationQueue.length > 5000) {
       evaluationQueue = evaluationQueue.filter(item =>
         item.status === 'evaluating' ||
         Date.now() - new Date(item.addedTime).getTime() < 86400000
       );
+
+      saveState();
     }
   } finally {
     evaluationBusy = false;
@@ -1157,6 +1216,7 @@ async function runEvaluationWorker() {
 
 async function runPositionMonitor() {
   if (positionMonitorBusy) return;
+
   positionMonitorBusy = true;
 
   try {
@@ -1196,6 +1256,7 @@ app.post('/new-launch', async (req, res) => {
       : req.body;
 
     const mint = extractLaunchMint(event);
+
     const deployerWallet =
       event?.feePayer ||
       event?.deployer ||
@@ -1229,7 +1290,10 @@ app.post('/new-launch', async (req, res) => {
     });
   } catch (error) {
     console.error('Webhook error:', error.message);
-    return res.status(500).json({ error: 'Webhook processing failed' });
+
+    return res.status(500).json({
+      error: 'Webhook processing failed',
+    });
   }
 });
 
@@ -1247,9 +1311,10 @@ app.get('/api/status', (req, res) => {
       item => item.status === 'evaluating'
     ).length,
     acceptedCoins: evaluationQueue.filter(
-      item => item.status === 'accepted' ||
-              item.status === 'paper_traded' ||
-              item.status === 'accepted_no_entry_price'
+      item =>
+        item.status === 'accepted' ||
+        item.status === 'paper_traded' ||
+        item.status === 'accepted_no_entry_price'
     ).length,
     rejectedCoins: evaluationQueue.filter(
       item => item.status === 'rejected'
@@ -1282,11 +1347,14 @@ app.get('/api/learning', (req, res) => {
 
 app.get('/api/portfolio', (req, res) => {
   const realizedPnlUsd = closedTrades.reduce(
-    (sum, trade) => sum + Number(trade.pnlUsd || 0), 0
+    (sum, trade) => sum + Number(trade.pnlUsd || 0),
+    0
   );
 
   const unrealizedPnlUsd = openPositions.reduce(
-    (sum, position) => sum + Number(position.unrealizedPnlUsd || 0), 0
+    (sum, position) =>
+      sum + Number(position.unrealizedPnlUsd || 0),
+    0
   );
 
   res.json({
@@ -1305,7 +1373,7 @@ app.get('/api/portfolio', (req, res) => {
   });
 });
 
-// Complete outcome dataset, including rejected coins.
+// All detected coins, including rejected coins.
 app.get('/outcomes', (req, res) => {
   const summary = {
     totalScanned: coinOutcomes.length,
@@ -1330,7 +1398,7 @@ app.get('/outcomes', (req, res) => {
   });
 });
 
-// CSV export for analysis and future training.
+// CSV export for analysis.
 app.get('/outcomes.csv', (req, res) => {
   const columns = [
     'mint',
@@ -1349,10 +1417,11 @@ app.get('/outcomes.csv', (req, res) => {
   ];
 
   function csvCell(value) {
-    const text = value === null || value === undefined
+    const cell = value === null || value === undefined
       ? ''
       : String(value);
-    return `"${text.replace(/"/g, '""')}"`;
+
+    return `"${cell.replace(/"/g, '""')}"`;
   }
 
   const rows = coinOutcomes.map(record => [
@@ -1381,20 +1450,24 @@ app.get('/outcomes.csv', (req, res) => {
     'Content-Disposition',
     'attachment; filename="memeradar-outcomes.csv"'
   );
+
   res.send(csv);
 });
 
 // ------------------------------------------------------------
-// SIMPLE DASHBOARD
+// DASHBOARD
 // ------------------------------------------------------------
 
 app.get('/', (req, res) => {
   const openPnl = openPositions.reduce(
-    (sum, position) => sum + Number(position.unrealizedPnlUsd || 0), 0
+    (sum, position) =>
+      sum + Number(position.unrealizedPnlUsd || 0),
+    0
   );
 
   const closedPnl = closedTrades.reduce(
-    (sum, trade) => sum + Number(trade.pnlUsd || 0), 0
+    (sum, trade) => sum + Number(trade.pnlUsd || 0),
+    0
   );
 
   const rows = evaluationQueue.slice(-30).reverse().map(item => `
@@ -1415,9 +1488,12 @@ app.get('/', (req, res) => {
 <title>MemeRadar</title>
 <style>
 body{font-family:system-ui,sans-serif;max-width:1200px;margin:30px auto;padding:0 18px;background:#111;color:#eee}
-h1{margin-bottom:5px}p{color:#aaa}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+h1{margin-bottom:5px}
+p{color:#aaa}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
 .card{background:#202020;padding:16px;border-radius:10px;overflow-wrap:anywhere}
-.value{font-size:24px;font-weight:700}table{border-collapse:collapse;width:100%;margin-top:20px}
+.value{font-size:24px;font-weight:700}
+table{border-collapse:collapse;width:100%;margin-top:20px}
 th,td{text-align:left;padding:10px;border-bottom:1px solid #333;overflow-wrap:anywhere}
 a{color:#8ab4ff;margin-right:14px}
 </style>
@@ -1452,20 +1528,20 @@ a{color:#8ab4ff;margin-right:14px}
 });
 
 // ------------------------------------------------------------
-// START
+// START SERVER
 // ------------------------------------------------------------
 
-setInterval(
+const evaluationTimer = setInterval(
   runEvaluationWorker,
   CONFIG.EVALUATION_INTERVAL_SECONDS * 1000
 );
 
-setInterval(
+const outcomeTimer = setInterval(
   runOutcomeTracker,
   CONFIG.OUTCOME_SAMPLE_INTERVAL_SECONDS * 1000
 );
 
-setInterval(
+const positionTimer = setInterval(
   runPositionMonitor,
   CONFIG.POSITION_CHECK_SECONDS * 1000
 );
@@ -1473,14 +1549,22 @@ setInterval(
 const server = app.listen(CONFIG.PORT, () => {
   console.log(`MemeRadar running on port ${CONFIG.PORT}`);
   console.log(`Dashboard: http://localhost:${CONFIG.PORT}`);
-  console.log(`Webhook:   http://localhost:${CONFIG.PORT}/new-launch`);
-  console.log(`Outcomes:  http://localhost:${CONFIG.PORT}/outcomes`);
-  console.log(`CSV:       http://localhost:${CONFIG.PORT}/outcomes.csv`);
+  console.log(`Webhook:   /new-launch`);
+  console.log(`Status:    /api/status`);
+  console.log(`Learning:  /api/learning`);
+  console.log(`Portfolio: /api/portfolio`);
+  console.log(`Outcomes:  /outcomes`);
+  console.log(`CSV:       /outcomes.csv`);
   console.log('Mode: PAPER TRADING ONLY');
 });
 
 function shutdown() {
   console.log('Saving MemeRadar state...');
+
+  clearInterval(evaluationTimer);
+  clearInterval(outcomeTimer);
+  clearInterval(positionTimer);
+
   saveState();
 
   server.close(() => {
