@@ -1,22 +1,26 @@
 // memeradar-scorer.js
 // Webhook receiver + paper-trading pipeline for new pump.fun launches,
-// Cupsey-style: tight dev-holding and legitimacy filters, immediate entry
-// instead of waiting for a dip (speed over conviction), and fast,
-// disciplined exits rather than letting winners run. Four layers:
+// Cupsey-style filters, with layer 1 running as a repeated evaluation over
+// a window rather than a single snapshot. Four layers:
 //
-//   1. Is the coin good?      -> composite scoring (holder concentration,
-//                                 deployer history, liquidity safety, dev
-//                                 holding %, dex-paid signal, narrative,
-//                                 smart money)
-//   2. When should I buy it?  -> immediate by default; a pullback-wait
-//                                 mode is still available via ENTRY_STYLE
+//   1. Is the coin good?      -> composite scoring, sampled repeatedly
+//                                 over EVALUATION_WINDOW_SECONDS rather
+//                                 than once at launch, so the decision is
+//                                 based on a trend (holders forming,
+//                                 liquidity staying locked, price not
+//                                 already dumping) instead of a single
+//                                 near-meaningless instant
+//   2. When should I buy it?  -> immediate by default once evaluation
+//                                 passes; a pullback-wait mode is still
+//                                 available via ENTRY_STYLE
 //   3. Place the buy          -> simulated entry at the real market price
 //                                 via Jupiter's quote API (no funds move)
 //   4. Watch the position     -> fast, tight exits
 //
 // IMPORTANT CAVEAT: the actual edge behind high-frequency sniper traders
-// is largely raw latency — being in the same block as the launch. This
-// script polls on an interval and cannot replicate that.
+// is largely raw latency — being in the same block as the launch. Adding
+// a 60-second evaluation window moves further away from that, on purpose:
+// the tradeoff here is giving up speed for a better-informed decision.
 //
 // Setup:
 //   npm install
@@ -38,7 +42,6 @@ const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
 const PUMP_FUN_PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
-// ---- Layer 1 weights — a starting point, not tuned on real outcomes yet. ----
 const WEIGHTS = {
   holderConcentration: 0.20,
   deployerHistory: 0.20,
@@ -49,9 +52,13 @@ const WEIGHTS = {
   smartMoney: 0.05,
 };
 
-// ---- Config for layers 2 to 4 — tune freely ----
 const SIM_CONFIG = {
-  BUY_THRESHOLD: 60,
+  // Layer 1: repeated evaluation instead of a single snapshot
+  EVALUATION_WINDOW_SECONDS: 60,
+  EVALUATION_SAMPLE_INTERVAL_SECONDS: 12,   // ~5 samples across the window
+  MIN_VALID_SAMPLES: 2,                     // need at least this many usable samples to decide at all
+  BUY_THRESHOLD: 60,                        // applied to the AVERAGE score across samples
+  PRICE_DROP_REJECT_PCT: 30,                // reject if price already fell this much within the window — catches an instant dump a single snapshot would miss
 
   POSITION_SIZE_USDC: 100,
 
@@ -63,11 +70,6 @@ const SIM_CONFIG = {
   PRICE_HISTORY_MAX_SAMPLES: 60,
 
   MAX_DEV_HOLDING_PCT: 5,
-
-  // A past launch by this deployer that cleared this market cap counted as
-  // "survived" rather than an instant dump. Tunable — real migration off
-  // the bonding curve happens around $69k, this is a much lower bar meant
-  // to separate "got some real buying interest" from background noise.
   DEPLOYER_SURVIVAL_MCAP_USD: 10000,
 
   TAKE_PROFIT_PCT: 20,
@@ -79,7 +81,8 @@ const SIM_CONFIG = {
 };
 
 const STATE_FILE = './paper-trades.json';
-let watchlist = [];
+let evaluationQueue = []; // layer 1: coins being sampled repeatedly before a decision
+let watchlist = [];       // layer 2 (pullback mode only): passed evaluation, waiting for an entry
 let openPositions = [];
 let closedTrades = [];
 
@@ -87,10 +90,12 @@ function loadState() {
   try {
     const raw = fs.readFileSync(STATE_FILE, 'utf-8');
     const parsed = JSON.parse(raw);
+    evaluationQueue = parsed.evaluationQueue || [];
     watchlist = parsed.watchlist || [];
     openPositions = parsed.openPositions || [];
     closedTrades = parsed.closedTrades || [];
   } catch {
+    evaluationQueue = [];
     watchlist = [];
     openPositions = [];
     closedTrades = [];
@@ -98,13 +103,13 @@ function loadState() {
 }
 
 function saveState() {
-  fs.writeFileSync(STATE_FILE, JSON.stringify({ watchlist, openPositions, closedTrades }, null, 2));
+  fs.writeFileSync(STATE_FILE, JSON.stringify({ evaluationQueue, watchlist, openPositions, closedTrades }, null, 2));
 }
 
 loadState();
 
 // =====================================================================
-// LAYER 1: is the coin good?
+// Scoring inputs (same as before)
 // =====================================================================
 
 async function getHolderAndDevData(mint, deployerWallet) {
@@ -145,8 +150,6 @@ async function getHolderAndDevData(mint, deployerWallet) {
   }
 }
 
-// Single RugCheck fetch, shared by liquiditySafety and deployerHistory below
-// so we don't hit the API twice for one launch.
 async function getRugCheckReport(mint) {
   try {
     const res = await fetch(`https://api.rugcheck.xyz/v1/tokens/${mint}/report`);
@@ -164,10 +167,9 @@ function deriveLiquiditySafety(report) {
   const market = Array.isArray(report.markets) ? report.markets[0] : null;
   const lpLockedPct = market?.lp?.lpLockedPct ?? 0;
 
-  // Scale smoothly: fully locked costs nothing, fully unlocked costs 50.
   let score = 100 - (100 - lpLockedPct) * 0.5;
-  if (report.mintAuthority) score -= 25;   // deployer can still mint more supply
-  if (report.freezeAuthority) score -= 25; // deployer can freeze wallets
+  if (report.mintAuthority) score -= 25;
+  if (report.freezeAuthority) score -= 25;
 
   return {
     score: Math.max(0, score),
@@ -175,41 +177,28 @@ function deriveLiquiditySafety(report) {
   };
 }
 
-// Uses RugCheck's creatorTokens field — the deployer's own past launches,
-// each with the market cap it reached — instead of guessing from raw
-// Helius transaction history.
 function deriveDeployerHistory(report) {
   const tokens = report?.creatorTokens;
   if (!Array.isArray(tokens) || tokens.length === 0) {
-    // No history isn't a point for or against — neutral score.
     return { score: 50, raw: { totalPastLaunches: 0 } };
   }
-
   const threshold = SIM_CONFIG.DEPLOYER_SURVIVAL_MCAP_USD;
   const survived = tokens.filter(t => (t.marketCap || 0) >= threshold).length;
   const survivalRate = survived / tokens.length;
-
   return {
     score: survivalRate * 100,
     raw: { totalPastLaunches: tokens.length, survived, survivalMcapThresholdUSD: threshold },
   };
 }
 
-// Cupsey-style "dex paid" signal. Best-effort against DexScreener's orders
-// endpoint — a token with no orders yet (true for anything seconds old)
-// returns a non-JSON 404 page rather than an empty array, so that's
-// treated as "not paid" instead of an error.
 async function getDexPaid(mint) {
   try {
     const res = await fetch(`https://api.dexscreener.com/orders/v1/solana/${mint}`);
-
     if (!res.ok) return { score: 0, raw: { paid: false, note: `http ${res.status}` } };
-
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
       return { score: 0, raw: { paid: false, note: 'non-JSON response' } };
     }
-
     const data = await res.json();
     const paid = Array.isArray(data) && data.some(order => order.status === 'approved');
     return { score: paid ? 100 : 0, raw: { paid } };
@@ -219,12 +208,10 @@ async function getDexPaid(mint) {
 }
 
 async function getNarrativeScore(tokenName, tokenSymbol) {
-  // Wire this into whatever MemeRadar already uses for AI web lookups.
   return { score: 50, raw: 'not yet wired to MemeRadar narrative logic' };
 }
 
 async function getSmartMoneyScore(mint) {
-  // Needs a labeled-wallet source (Arkham, Nansen). Stubbed until you pick one.
   return { score: 0, raw: 'not yet wired to a labeled-wallet source' };
 }
 
@@ -241,9 +228,6 @@ function computeCompositeScore(components) {
   return weightUsed > 0 ? Math.round(total / weightUsed) : null;
 }
 
-// =====================================================================
-// Shared: price sampling via Jupiter (quote only — no funds ever move)
-// =====================================================================
 async function getApproxPrice(mint) {
   try {
     const amountBaseUnits = SIM_CONFIG.PROBE_USDC_AMOUNT * 1_000_000;
@@ -260,7 +244,95 @@ async function getApproxPrice(mint) {
 }
 
 // =====================================================================
-// LAYER 2: when should I buy it?
+// LAYER 1: repeated evaluation over a window, not a single snapshot
+// =====================================================================
+
+function addToEvaluationQueue(mint, deployerWallet, tokenName, tokenSymbol) {
+  evaluationQueue.push({
+    mint, deployerWallet, tokenName, tokenSymbol,
+    addedTime: new Date().toISOString(),
+    snapshots: [],
+  });
+  saveState();
+  console.log(`Evaluating ${tokenSymbol} over the next ${SIM_CONFIG.EVALUATION_WINDOW_SECONDS}s...`);
+}
+
+function removeFromEvaluationQueue(mint) {
+  evaluationQueue = evaluationQueue.filter(e => e.mint !== mint);
+}
+
+async function takeSnapshot(item) {
+  const [holderAndDev, rugCheckReport, dexPaid, narrative, smartMoney, price] = await Promise.all([
+    getHolderAndDevData(item.mint, item.deployerWallet),
+    getRugCheckReport(item.mint),
+    getDexPaid(item.mint),
+    getNarrativeScore(item.tokenName, item.tokenSymbol),
+    getSmartMoneyScore(item.mint),
+    getApproxPrice(item.mint),
+  ]);
+
+  const components = {
+    holderConcentration: holderAndDev.holderConcentration,
+    devHolding: holderAndDev.devHolding,
+    deployerHistory: deriveDeployerHistory(rugCheckReport),
+    liquiditySafety: deriveLiquiditySafety(rugCheckReport),
+    dexPaid,
+    narrative,
+    smartMoney,
+  };
+  const compositeScore = computeCompositeScore(components);
+
+  item.snapshots.push({ time: new Date().toISOString(), compositeScore, price, components });
+}
+
+async function finalizeEvaluation(item) {
+  const valid = item.snapshots.filter(s => s.compositeScore !== null);
+
+  if (valid.length < SIM_CONFIG.MIN_VALID_SAMPLES) {
+    console.log(`Skipped ${item.tokenSymbol} — only ${valid.length} usable samples over the window, not enough data.`);
+    return;
+  }
+
+  const avgScore = valid.reduce((sum, s) => sum + s.compositeScore, 0) / valid.length;
+  const minScore = Math.min(...valid.map(s => s.compositeScore));
+
+  const pricedSamples = valid.filter(s => s.price !== null);
+  let priceChangePct = null;
+  if (pricedSamples.length >= 2) {
+    const first = pricedSamples[0].price;
+    const last = pricedSamples[pricedSamples.length - 1].price;
+    priceChangePct = ((last - first) / first) * 100;
+  }
+
+  const alreadyDumping = priceChangePct !== null && priceChangePct <= -SIM_CONFIG.PRICE_DROP_REJECT_PCT;
+
+  console.log(
+    `Evaluation done for ${item.tokenSymbol}: avg ${Math.round(avgScore)}, min ${Math.round(minScore)}, ` +
+    `price change ${priceChangePct !== null ? priceChangePct.toFixed(1) + '%' : 'n/a'}, samples ${valid.length}`
+  );
+
+  if (avgScore < SIM_CONFIG.BUY_THRESHOLD) {
+    console.log(`Rejected ${item.tokenSymbol} — average score ${Math.round(avgScore)} below threshold.`);
+    return;
+  }
+  if (alreadyDumping) {
+    console.log(`Rejected ${item.tokenSymbol} — price already down ${priceChangePct.toFixed(1)}% during evaluation, looks like a dump.`);
+    return;
+  }
+
+  const lastPrice = pricedSamples.length > 0 ? pricedSamples[pricedSamples.length - 1].price : undefined;
+  const compositeScoreForRecord = Math.round(avgScore);
+
+  if (SIM_CONFIG.ENTRY_STYLE === 'immediate') {
+    await simulateBuy(item.mint, item.tokenName, item.tokenSymbol, compositeScoreForRecord, lastPrice, 'post_evaluation');
+  } else {
+    addToWatchlist(item.mint, item.tokenName, item.tokenSymbol, compositeScoreForRecord);
+  }
+}
+
+// =====================================================================
+// LAYER 2: when should I buy it? (pullback mode only — immediate mode
+// buys right after evaluation finishes, see finalizeEvaluation above)
 // =====================================================================
 
 function addToWatchlist(mint, tokenName, tokenSymbol, compositeScore) {
@@ -386,6 +458,7 @@ function computeSummary() {
   const winRatePct = totalClosed > 0 ? Math.round((wins / totalClosed) * 1000) / 10 : null;
 
   return {
+    evaluatingCount: evaluationQueue.length,
     watchlistCount: watchlist.length,
     openPositionCount: openPositions.length,
     totalClosedTrades: totalClosed,
@@ -395,19 +468,35 @@ function computeSummary() {
 }
 
 // ---- Background loops ----
+
+// Layer 1: repeated evaluation
+setInterval(async () => {
+  for (const item of [...evaluationQueue]) {
+    await takeSnapshot(item);
+    const elapsedSeconds = (Date.now() - new Date(item.addedTime).getTime()) / 1000;
+    if (elapsedSeconds >= SIM_CONFIG.EVALUATION_WINDOW_SECONDS) {
+      await finalizeEvaluation(item);
+      removeFromEvaluationQueue(item.mint);
+    }
+  }
+  saveState();
+}, SIM_CONFIG.EVALUATION_SAMPLE_INTERVAL_SECONDS * 1000);
+
+// Layer 2: pullback-mode entry timing (no-op in 'immediate' mode, watchlist stays empty)
 setInterval(async () => {
   for (const item of [...watchlist]) {
     await evaluateEntryTiming(item);
   }
 }, SIM_CONFIG.ENTRY_SAMPLE_INTERVAL_SECONDS * 1000);
 
+// Layer 4: position monitoring
 setInterval(async () => {
   for (const position of [...openPositions]) {
     await evaluatePosition(position);
   }
 }, SIM_CONFIG.CHECK_INTERVAL_SECONDS * 1000);
 
-// ---- Webhook endpoint: new launch detected (triggers layer 1) ----
+// ---- Webhook endpoint: new launch detected -> enters layer 1 evaluation ----
 app.post('/new-launch', async (req, res) => {
   try {
     const event = Array.isArray(req.body) ? req.body[0] : req.body;
@@ -420,46 +509,17 @@ app.post('/new-launch', async (req, res) => {
       return res.status(400).json({ error: 'missing mint or deployer in payload' });
     }
 
-    const [holderAndDev, rugCheckReport, dexPaid, narrative, smartMoney] =
-      await Promise.all([
-        getHolderAndDevData(mint, deployerWallet),
-        getRugCheckReport(mint),
-        getDexPaid(mint),
-        getNarrativeScore(tokenName, tokenSymbol),
-        getSmartMoneyScore(mint),
-      ]);
-
-    const components = {
-      holderConcentration: holderAndDev.holderConcentration,
-      devHolding: holderAndDev.devHolding,
-      deployerHistory: deriveDeployerHistory(rugCheckReport),
-      liquiditySafety: deriveLiquiditySafety(rugCheckReport),
-      dexPaid,
-      narrative,
-      smartMoney,
-    };
-    const compositeScore = computeCompositeScore(components);
-
-    console.log(JSON.stringify({ mint, tokenName, tokenSymbol, deployerWallet, compositeScore, components }, null, 2));
-
-    if (compositeScore !== null && compositeScore >= SIM_CONFIG.BUY_THRESHOLD) {
-      if (SIM_CONFIG.ENTRY_STYLE === 'immediate') {
-        await simulateBuy(mint, tokenName, tokenSymbol, compositeScore, undefined, 'immediate');
-      } else {
-        addToWatchlist(mint, tokenName, tokenSymbol, compositeScore);
-      }
-    }
-
-    res.status(200).json({ ok: true, compositeScore });
+    addToEvaluationQueue(mint, deployerWallet, tokenName, tokenSymbol);
+    res.status(200).json({ ok: true, status: 'queued for evaluation' });
   } catch (err) {
-    console.error('Error scoring launch:', err);
+    console.error('Error handling new launch:', err);
     res.status(500).json({ error: 'internal error' });
   }
 });
 
 // ---- View the full pipeline ----
 app.get('/portfolio', (req, res) => {
-  res.json({ summary: computeSummary(), watchlist, openPositions, closedTrades });
+  res.json({ summary: computeSummary(), evaluationQueue, watchlist, openPositions, closedTrades });
 });
 
 const PORT = process.env.PORT || 3000;
@@ -468,48 +528,34 @@ app.listen(PORT, () => console.log(`MemeRadar scorer + simulator listening on po
 /* ----------------------------------------------------------------------
 README
 
-1. API keys: Birdeye (birdeye.so) is the only one this script calls at
-   runtime now. RugCheck, Jupiter, and DexScreener need no key. Helius is
-   still used to register the webhook from your Helius dashboard, but the
-   script itself no longer needs the Helius API key for anything else —
-   deployerHistory now comes from RugCheck's creatorTokens field instead.
+1. API keys: only Birdeye (birdeye.so) is called at runtime. RugCheck,
+   Jupiter, and DexScreener need no key. Helius is only used to register
+   the webhook from your Helius dashboard.
 
 2. Deploy with a stable public URL and a long-running process.
 
-3. Register the Helius webhook once deployed:
+3. Register the Helius webhook as before (see prior setup notes) pointed
+   at /new-launch.
 
-   POST https://api.helius.xyz/v0/webhooks?api-key=YOUR_KEY
-   {
-     "webhookURL": "https://your-deployed-url.com/new-launch",
-     "transactionTypes": ["CREATE"],
-     "accountAddresses": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"],
-     "webhookType": "enhanced"
-   }
+4. What changed: a new launch no longer gets scored once and acted on
+   immediately. It's added to an evaluation queue and sampled roughly
+   every EVALUATION_SAMPLE_INTERVAL_SECONDS (12s) for
+   EVALUATION_WINDOW_SECONDS (60s) — about 5 samples. After the window:
+     - needs at least MIN_VALID_SAMPLES usable samples to decide at all
+     - the AVERAGE composite score across samples must clear BUY_THRESHOLD
+     - price is checked start-to-end of the window — if it already fell
+       more than PRICE_DROP_REJECT_PCT, it's rejected as a likely dump,
+       something a single snapshot could never catch
+   Only then does it proceed to layer 2/3 (buy immediately, or go on the
+   pullback watchlist if ENTRY_STYLE is 'pullback').
 
-4. Two fixes made after reviewing real logs:
-   - liquiditySafety was checking a field (liquidity.locked) that doesn't
-     exist in RugCheck's actual schema. It now reads lpLockedPct from the
-     real markets[].lp object.
-   - dexPaid was crashing on a non-JSON 404 response for brand-new tokens
-     with no orders yet. It now treats that as "not paid" instead of an
-     error.
+5. This trades speed for information on purpose. A coin is roughly a
+   minute old by the time a decision is made, instead of a few seconds.
+   That's the real cost of sampling a trend instead of a single instant.
 
-5. deployerHistory now uses RugCheck's own creatorTokens list — the
-   deployer's past launches with their market caps — rather than a Helius
-   transaction-history stub. A past launch counts as "survived" if it
-   cleared DEPLOYER_SURVIVAL_MCAP_USD (default $10,000, well under full
-   bonding-curve migration at ~$69k, meant to separate real traction from
-   background noise). Tune that threshold as you see real outcomes.
-
-6. Cupsey-style adjustments: devHolding and dexPaid scoring inputs,
-   ENTRY_STYLE defaults to 'immediate', and exits are tighter/faster
-   (TAKE_PROFIT_PCT, STOP_LOSS_PCT, MAX_HOLD_MINUTES). None of this
-   replicates the latency edge real snipers rely on — this approximates
-   the selection and exit philosophy on a polling interval, not sub-block
-   execution.
+6. GET /portfolio now also shows evaluationQueue — coins currently being
+   sampled, with every snapshot so far, alongside the watchlist, open
+   positions, and closed trades.
 
 7. Still stubbed: getNarrativeScore, getSmartMoneyScore.
-
-8. GET /portfolio shows the watchlist, open positions, closed trades, and
-   running win rate / total P&L. State persists to paper-trades.json.
 ---------------------------------------------------------------------- */
