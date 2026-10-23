@@ -1,26 +1,22 @@
 // memeradar-scorer.js
 // Webhook receiver + paper-trading pipeline for new pump.fun launches,
-// adjusted toward a Cupsey-style approach: tight dev-holding and
-// legitimacy filters, immediate entry instead of waiting for a dip
-// (speed over conviction), and fast, disciplined exits rather than
-// letting winners run. Structured as four layers of judgment:
+// Cupsey-style: tight dev-holding and legitimacy filters, immediate entry
+// instead of waiting for a dip (speed over conviction), and fast,
+// disciplined exits rather than letting winners run. Four layers:
 //
 //   1. Is the coin good?      -> composite scoring (holder concentration,
 //                                 deployer history, liquidity safety, dev
 //                                 holding %, dex-paid signal, narrative,
 //                                 smart money)
-//   2. When should I buy it?  -> immediate by default (speed over
-//                                 conviction); a pullback-wait mode is
-//                                 still available via SIM_CONFIG.ENTRY_STYLE
+//   2. When should I buy it?  -> immediate by default; a pullback-wait
+//                                 mode is still available via ENTRY_STYLE
 //   3. Place the buy          -> simulated entry at the real market price
 //                                 via Jupiter's quote API (no funds move)
-//   4. Watch the position     -> fast, tight exits: smaller take profit,
-//                                 tighter stop loss, short max hold time
+//   4. Watch the position     -> fast, tight exits
 //
 // IMPORTANT CAVEAT: the actual edge behind high-frequency sniper traders
 // is largely raw latency — being in the same block as the launch. This
-// script polls on an interval and cannot replicate that. What it can
-// replicate is the selection filters and the fast, disciplined exits.
+// script polls on an interval and cannot replicate that.
 //
 // Setup:
 //   npm install
@@ -38,7 +34,6 @@ import 'dotenv/config';
 const app = express();
 app.use(express.json());
 
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
 const PUMP_FUN_PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -48,30 +43,33 @@ const WEIGHTS = {
   holderConcentration: 0.20,
   deployerHistory: 0.20,
   liquiditySafety: 0.15,
-  devHolding: 0.15,   // Cupsey-style: how much supply the deployer itself still holds
-  dexPaid: 0.10,       // Cupsey-style: has the project paid for a DexScreener profile/boost
+  devHolding: 0.15,
+  dexPaid: 0.10,
   narrative: 0.15,
   smartMoney: 0.05,
 };
 
 // ---- Config for layers 2 to 4 — tune freely ----
 const SIM_CONFIG = {
-  BUY_THRESHOLD: 60,               // composite score needed to act at all
+  BUY_THRESHOLD: 60,
 
   POSITION_SIZE_USDC: 100,
 
-  // Layer 2: entry timing
-  ENTRY_STYLE: 'immediate',        // 'immediate' (Cupsey-style: speed over conviction) or 'pullback' (wait for a dip)
-  PULLBACK_PCT_MIN: 8,             // only used when ENTRY_STYLE is 'pullback'
+  ENTRY_STYLE: 'immediate',        // 'immediate' (Cupsey-style) or 'pullback' (wait for a dip)
+  PULLBACK_PCT_MIN: 8,
   CONFIRMATION_TICKS: 2,
   MAX_ENTRY_WAIT_MINUTES: 15,
   ENTRY_SAMPLE_INTERVAL_SECONDS: 15,
   PRICE_HISTORY_MAX_SAMPLES: 60,
 
-  // Cupsey-style filters
-  MAX_DEV_HOLDING_PCT: 5,          // skip if the deployer wallet still holds more than this % of supply
+  MAX_DEV_HOLDING_PCT: 5,
 
-  // Layer 4: position monitoring — fast, tight exits rather than letting winners run
+  // A past launch by this deployer that cleared this market cap counted as
+  // "survived" rather than an instant dump. Tunable — real migration off
+  // the bonding curve happens around $69k, this is a much lower bar meant
+  // to separate "got some real buying interest" from background noise.
+  DEPLOYER_SURVIVAL_MCAP_USD: 10000,
+
   TAKE_PROFIT_PCT: 20,
   STOP_LOSS_PCT: 12,
   MAX_HOLD_MINUTES: 10,
@@ -109,9 +107,6 @@ loadState();
 // LAYER 1: is the coin good?
 // =====================================================================
 
-// Fetches the holder list once and derives both the top-10 concentration
-// score and the deployer's own holding % from the same data, so we don't
-// hit Birdeye twice for one launch.
 async function getHolderAndDevData(mint, deployerWallet) {
   try {
     const res = await fetch(
@@ -150,55 +145,64 @@ async function getHolderAndDevData(mint, deployerWallet) {
   }
 }
 
-async function getDeployerHistory(deployerWallet) {
-  try {
-    const res = await fetch(
-      `https://api.helius.xyz/v0/addresses/${deployerWallet}/transactions?api-key=${HELIUS_API_KEY}`
-    );
-    const txs = await res.json();
-    const pastLaunches = (txs || []).filter(tx =>
-      tx.instructions?.some(ix => ix.programId === PUMP_FUN_PROGRAM_ID && ix.type === 'CREATE')
-    );
-    if (pastLaunches.length === 0) return { score: 50, raw: { totalPastLaunches: 0 } };
-
-    const survivedCount = await countSurvivedLaunches(pastLaunches);
-    const survivalRate = survivedCount / pastLaunches.length;
-    return { score: survivalRate * 100, raw: { totalPastLaunches: pastLaunches.length, survived: survivedCount } };
-  } catch (err) {
-    return { score: null, raw: `error: ${err.message}` };
-  }
-}
-
-async function countSurvivedLaunches(pastLaunches) {
-  // Placeholder: check each past mint's current liquidity/holder count.
-  return 0;
-}
-
-async function getLiquiditySafety(mint) {
+// Single RugCheck fetch, shared by liquiditySafety and deployerHistory below
+// so we don't hit the API twice for one launch.
+async function getRugCheckReport(mint) {
   try {
     const res = await fetch(`https://api.rugcheck.xyz/v1/tokens/${mint}/report`);
-    const data = await res.json();
-    let score = 100;
-    if (!data?.liquidity?.locked) score -= 50;
-    if (data?.mintAuthority) score -= 25;
-    if (data?.freezeAuthority) score -= 25;
-    return { score: Math.max(0, score), raw: data };
-  } catch (err) {
-    return { score: null, raw: `error: ${err.message}` };
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
   }
 }
 
-// Cupsey-style "dex paid" signal — whether the project has paid for a
-// DexScreener token profile or boost, used in that community as a loose
-// legitimacy/commitment signal. Best-effort: DexScreener's API shape for
-// this isn't formally documented and can change, so verify this still
-// returns what you expect before relying on it.
+function deriveLiquiditySafety(report) {
+  if (!report) return { score: null, raw: 'rugcheck fetch failed' };
+  if (report.rugged === true) return { score: 0, raw: { rugged: true } };
+
+  const market = Array.isArray(report.markets) ? report.markets[0] : null;
+  const lpLockedPct = market?.lp?.lpLockedPct ?? 0;
+
+  // Scale smoothly: fully locked costs nothing, fully unlocked costs 50.
+  let score = 100 - (100 - lpLockedPct) * 0.5;
+  if (report.mintAuthority) score -= 25;   // deployer can still mint more supply
+  if (report.freezeAuthority) score -= 25; // deployer can freeze wallets
+
+  return {
+    score: Math.max(0, score),
+    raw: { lpLockedPct, mintAuthority: report.mintAuthority, freezeAuthority: report.freezeAuthority },
+  };
+}
+
+// Uses RugCheck's creatorTokens field — the deployer's own past launches,
+// each with the market cap it reached — instead of guessing from raw
+// Helius transaction history.
+function deriveDeployerHistory(report) {
+  const tokens = report?.creatorTokens;
+  if (!Array.isArray(tokens) || tokens.length === 0) {
+    // No history isn't a point for or against — neutral score.
+    return { score: 50, raw: { totalPastLaunches: 0 } };
+  }
+
+  const threshold = SIM_CONFIG.DEPLOYER_SURVIVAL_MCAP_USD;
+  const survived = tokens.filter(t => (t.marketCap || 0) >= threshold).length;
+  const survivalRate = survived / tokens.length;
+
+  return {
+    score: survivalRate * 100,
+    raw: { totalPastLaunches: tokens.length, survived, survivalMcapThresholdUSD: threshold },
+  };
+}
+
+// Cupsey-style "dex paid" signal. Best-effort against DexScreener's orders
+// endpoint — a token with no orders yet (true for anything seconds old)
+// returns a non-JSON 404 page rather than an empty array, so that's
+// treated as "not paid" instead of an error.
 async function getDexPaid(mint) {
   try {
     const res = await fetch(`https://api.dexscreener.com/orders/v1/solana/${mint}`);
 
-    // A brand-new token with no orders yet gets a 404 HTML page here, not an
-    // empty JSON array — treat that as "not paid" rather than an error.
     if (!res.ok) return { score: 0, raw: { paid: false, note: `http ${res.status}` } };
 
     const contentType = res.headers.get('content-type') || '';
@@ -416,11 +420,10 @@ app.post('/new-launch', async (req, res) => {
       return res.status(400).json({ error: 'missing mint or deployer in payload' });
     }
 
-    const [holderAndDev, deployerHistory, liquiditySafety, dexPaid, narrative, smartMoney] =
+    const [holderAndDev, rugCheckReport, dexPaid, narrative, smartMoney] =
       await Promise.all([
         getHolderAndDevData(mint, deployerWallet),
-        getDeployerHistory(deployerWallet),
-        getLiquiditySafety(mint),
+        getRugCheckReport(mint),
         getDexPaid(mint),
         getNarrativeScore(tokenName, tokenSymbol),
         getSmartMoneyScore(mint),
@@ -429,8 +432,8 @@ app.post('/new-launch', async (req, res) => {
     const components = {
       holderConcentration: holderAndDev.holderConcentration,
       devHolding: holderAndDev.devHolding,
-      deployerHistory,
-      liquiditySafety,
+      deployerHistory: deriveDeployerHistory(rugCheckReport),
+      liquiditySafety: deriveLiquiditySafety(rugCheckReport),
       dexPaid,
       narrative,
       smartMoney,
@@ -441,7 +444,6 @@ app.post('/new-launch', async (req, res) => {
 
     if (compositeScore !== null && compositeScore >= SIM_CONFIG.BUY_THRESHOLD) {
       if (SIM_CONFIG.ENTRY_STYLE === 'immediate') {
-        // Cupsey-style: speed over conviction — act now rather than wait.
         await simulateBuy(mint, tokenName, tokenSymbol, compositeScore, undefined, 'immediate');
       } else {
         addToWatchlist(mint, tokenName, tokenSymbol, compositeScore);
@@ -455,7 +457,7 @@ app.post('/new-launch', async (req, res) => {
   }
 });
 
-// ---- View the full pipeline: watchlist, open positions, closed trades ----
+// ---- View the full pipeline ----
 app.get('/portfolio', (req, res) => {
   res.json({ summary: computeSummary(), watchlist, openPositions, closedTrades });
 });
@@ -466,12 +468,13 @@ app.listen(PORT, () => console.log(`MemeRadar scorer + simulator listening on po
 /* ----------------------------------------------------------------------
 README
 
-1. API keys: Helius (helius.dev), Birdeye (birdeye.so). RugCheck, Jupiter,
-   and DexScreener need no key for this usage.
+1. API keys: Birdeye (birdeye.so) is the only one this script calls at
+   runtime now. RugCheck, Jupiter, and DexScreener need no key. Helius is
+   still used to register the webhook from your Helius dashboard, but the
+   script itself no longer needs the Helius API key for anything else —
+   deployerHistory now comes from RugCheck's creatorTokens field instead.
 
-2. Deploy with a stable public URL and a long-running process (Render,
-   Railway, Fly.io, a small VPS) — the background loops need the process
-   to stay alive.
+2. Deploy with a stable public URL and a long-running process.
 
 3. Register the Helius webhook once deployed:
 
@@ -483,29 +486,30 @@ README
      "webhookType": "enhanced"
    }
 
-4. What changed to lean Cupsey-style:
-   - Two new scoring inputs: devHolding (flags launches where the deployer
-     still holds a large chunk of supply) and dexPaid (a loose legitimacy
-     signal used in that trading community).
-   - ENTRY_STYLE defaults to 'immediate' — act the moment a launch clears
-     BUY_THRESHOLD rather than waiting minutes for a pullback. Set it back
-     to 'pullback' in SIM_CONFIG to restore the earlier wait-for-a-dip logic.
-   - Exits are tighter and faster: TAKE_PROFIT_PCT and STOP_LOSS_PCT are
-     both smaller, and MAX_HOLD_MINUTES is much shorter, aiming for a high
-     volume of small, fast, disciplined trades rather than a few large ones.
+4. Two fixes made after reviewing real logs:
+   - liquiditySafety was checking a field (liquidity.locked) that doesn't
+     exist in RugCheck's actual schema. It now reads lpLockedPct from the
+     real markets[].lp object.
+   - dexPaid was crashing on a non-JSON 404 response for brand-new tokens
+     with no orders yet. It now treats that as "not paid" instead of an
+     error.
 
-5. The real caveat, worth repeating: none of the above replicates the
-   latency edge that actually drives high-frequency sniper performance.
-   This approximates the selection philosophy and risk discipline, run on
-   a polling interval measured in seconds, not the sub-block execution a
-   dedicated bot uses. Treat its results as a test of the filters and
-   exit logic, not a claim that it trades at the same speed.
+5. deployerHistory now uses RugCheck's own creatorTokens list — the
+   deployer's past launches with their market caps — rather than a Helius
+   transaction-history stub. A past launch counts as "survived" if it
+   cleared DEPLOYER_SURVIVAL_MCAP_USD (default $10,000, well under full
+   bonding-curve migration at ~$69k, meant to separate real traction from
+   background noise). Tune that threshold as you see real outcomes.
 
-6. GET /portfolio shows the watchlist (only populated in 'pullback' mode),
-   open positions, closed trades, and running win rate / total P&L. State
-   persists to paper-trades.json.
+6. Cupsey-style adjustments: devHolding and dexPaid scoring inputs,
+   ENTRY_STYLE defaults to 'immediate', and exits are tighter/faster
+   (TAKE_PROFIT_PCT, STOP_LOSS_PCT, MAX_HOLD_MINUTES). None of this
+   replicates the latency edge real snipers rely on — this approximates
+   the selection and exit philosophy on a polling interval, not sub-block
+   execution.
 
-7. Still stubbed: getNarrativeScore, getSmartMoneyScore, countSurvivedLaunches.
-   dexPaid is a best-effort call against an undocumented DexScreener
-   endpoint — verify it still returns the expected shape before trusting it.
+7. Still stubbed: getNarrativeScore, getSmartMoneyScore.
+
+8. GET /portfolio shows the watchlist, open positions, closed trades, and
+   running win rate / total P&L. State persists to paper-trades.json.
 ---------------------------------------------------------------------- */
