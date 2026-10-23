@@ -196,6 +196,16 @@ async function getLiquiditySafety(mint) {
 async function getDexPaid(mint) {
   try {
     const res = await fetch(`https://api.dexscreener.com/orders/v1/solana/${mint}`);
+
+    // A brand-new token with no orders yet gets a 404 HTML page here, not an
+    // empty JSON array — treat that as "not paid" rather than an error.
+    if (!res.ok) return { score: 0, raw: { paid: false, note: `http ${res.status}` } };
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      return { score: 0, raw: { paid: false, note: 'non-JSON response' } };
+    }
+
     const data = await res.json();
     const paid = Array.isArray(data) && data.some(order => order.status === 'approved');
     return { score: paid ? 100 : 0, raw: { paid } };
