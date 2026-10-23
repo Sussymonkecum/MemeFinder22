@@ -2,14 +2,12 @@
   "name": "memeradar-scorer",
   "version": "1.0.0",
   "type": "module",
-  "description": "Webhook receiver and scoring pipeline for new pump.fun launches",
-  "main": "memeradar-scorer.js",
   "scripts": {
     "start": "node memeradar-scorer.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "node-fetch": "^3.3.2",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
   }
 }
+
