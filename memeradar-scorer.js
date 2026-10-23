@@ -41,6 +41,9 @@ app.use(express.json());
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
 const PUMP_FUN_PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+const KNOWN_NON_LAUNCH_MINTS = new Set([SOL_MINT, USDC_MINT, USDT_MINT]);
 
 const WEIGHTS = {
   holderConcentration: 0.20,
@@ -228,7 +231,25 @@ function computeCompositeScore(components) {
   return weightUsed > 0 ? Math.round(total / weightUsed) : null;
 }
 
+// Birdeye indexes pump.fun's bonding curve directly, so it has a price for
+// tokens that haven't migrated to a DEX yet — which is nearly every brand
+// new launch. Jupiter only routes trades across DEX pools, so it has no
+// route at all for a pre-migration token; it's kept here only as a
+// fallback for tokens that have already migrated to Raydium, in case
+// Birdeye is slow to pick up a newly created pool.
 async function getApproxPrice(mint) {
+  try {
+    const res = await fetch(
+      `https://public-api.birdeye.so/defi/price?address=${mint}`,
+      { headers: { 'X-API-KEY': BIRDEYE_API_KEY } }
+    );
+    const data = await res.json();
+    const price = data?.data?.value;
+    if (typeof price === 'number' && price > 0) return price;
+  } catch {
+    // fall through to Jupiter
+  }
+
   try {
     const amountBaseUnits = SIM_CONFIG.PROBE_USDC_AMOUNT * 1_000_000;
     const res = await fetch(
@@ -240,6 +261,35 @@ async function getApproxPrice(mint) {
     return SIM_CONFIG.PROBE_USDC_AMOUNT / outAmount;
   } catch {
     return null;
+  }
+}
+
+// Picks the actual new-token mint out of a transaction's token transfers,
+// skipping SOL/USDC/USDT legs (e.g. the SOL paid for an initial buy) that
+// were previously being mistaken for the launch itself.
+function extractLaunchMint(event) {
+  const transfers = event?.tokenTransfers || [];
+  const candidate = transfers.find(t => t?.mint && !KNOWN_NON_LAUNCH_MINTS.has(t.mint));
+  return candidate?.mint || transfers[0]?.mint || null;
+}
+
+// The webhook payload's inline name/symbol field was never matching the
+// real Helius schema (always fell back to "unknown"). Fetching metadata
+// directly from Birdeye by mint address is more reliable than guessing
+// at the webhook's field names.
+async function getTokenMetadata(mint) {
+  try {
+    const res = await fetch(
+      `https://public-api.birdeye.so/defi/v3/token/meta-data/single?address=${mint}`,
+      { headers: { 'X-API-KEY': BIRDEYE_API_KEY } }
+    );
+    const data = await res.json();
+    return {
+      name: data?.data?.name || 'unknown',
+      symbol: data?.data?.symbol || 'unknown',
+    };
+  } catch {
+    return { name: 'unknown', symbol: 'unknown' };
   }
 }
 
@@ -500,15 +550,14 @@ setInterval(async () => {
 app.post('/new-launch', async (req, res) => {
   try {
     const event = Array.isArray(req.body) ? req.body[0] : req.body;
-    const mint = event?.tokenTransfers?.[0]?.mint;
+    const mint = extractLaunchMint(event);
     const deployerWallet = event?.feePayer;
-    const tokenName = event?.events?.token?.name || 'unknown';
-    const tokenSymbol = event?.events?.token?.symbol || 'unknown';
 
     if (!mint || !deployerWallet) {
       return res.status(400).json({ error: 'missing mint or deployer in payload' });
     }
 
+    const { name: tokenName, symbol: tokenSymbol } = await getTokenMetadata(mint);
     addToEvaluationQueue(mint, deployerWallet, tokenName, tokenSymbol);
     res.status(200).json({ ok: true, status: 'queued for evaluation' });
   } catch (err) {
