@@ -517,6 +517,62 @@ app.post('/new-launch', async (req, res) => {
   }
 });
 
+// ---- Simple status page at the root, so the bare URL shows something ----
+app.get('/', (req, res) => {
+  const s = computeSummary();
+  const recentTrades = closedTrades.slice(-10).reverse();
+
+  const tradeRows = recentTrades.length
+    ? recentTrades.map(t => `
+        <tr>
+          <td>${t.tokenSymbol}</td>
+          <td>${t.exitReason}</td>
+          <td style="color:${t.pnlPct >= 0 ? '#2ecc71' : '#e74c3c'}">${t.pnlPct}%</td>
+          <td style="color:${t.pnlUSDC >= 0 ? '#2ecc71' : '#e74c3c'}">$${t.pnlUSDC}</td>
+        </tr>`).join('')
+    : '<tr><td colspan="4">No closed trades yet</td></tr>';
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta http-equiv="refresh" content="30">
+      <title>MemeRadar status</title>
+      <style>
+        body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; padding: 2rem; max-width: 700px; margin: auto; }
+        h1 { font-size: 1.3rem; }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; margin: 1.5rem 0; }
+        .stat { background: #161b22; border-radius: 8px; padding: 0.75rem 1rem; }
+        .stat .label { font-size: 0.75rem; color: #8b949e; }
+        .stat .value { font-size: 1.2rem; font-weight: 600; }
+        table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+        th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #21262d; font-size: 0.9rem; }
+        a { color: #58a6ff; }
+      </style>
+    </head>
+    <body>
+      <h1>MemeRadar scorer + simulator</h1>
+      <div class="stats">
+        <div class="stat"><div class="label">Evaluating</div><div class="value">${s.evaluatingCount}</div></div>
+        <div class="stat"><div class="label">Watchlist</div><div class="value">${s.watchlistCount}</div></div>
+        <div class="stat"><div class="label">Open positions</div><div class="value">${s.openPositionCount}</div></div>
+        <div class="stat"><div class="label">Closed trades</div><div class="value">${s.totalClosedTrades}</div></div>
+        <div class="stat"><div class="label">Win rate</div><div class="value">${s.winRatePct !== null ? s.winRatePct + '%' : '—'}</div></div>
+        <div class="stat"><div class="label">Total P&L</div><div class="value" style="color:${s.totalRealizedPnlUSDC >= 0 ? '#2ecc71' : '#e74c3c'}">$${s.totalRealizedPnlUSDC}</div></div>
+      </div>
+      <h2 style="font-size:1rem;">Recent closed trades</h2>
+      <table>
+        <tr><th>Coin</th><th>Exit reason</th><th>P&L %</th><th>P&L $</th></tr>
+        ${tradeRows}
+      </table>
+      <p style="margin-top:1.5rem; font-size:0.85rem; color:#8b949e;">
+        Auto-refreshes every 30s. Full data: <a href="/portfolio">/portfolio</a>
+      </p>
+    </body>
+    </html>
+  `);
+});
+
 // ---- View the full pipeline ----
 app.get('/portfolio', (req, res) => {
   res.json({ summary: computeSummary(), evaluationQueue, watchlist, openPositions, closedTrades });
